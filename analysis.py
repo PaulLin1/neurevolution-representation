@@ -176,27 +176,52 @@ def effective_ranks(model: FFN) -> dict:
 # 4. Robustness (accuracy vs weight noise)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def weight_rms(model: FFN) -> float:
+    """RMS weight magnitude across all parameters."""
+    total_sq = sum(p.data.pow(2).sum().item() for p in model.parameters())
+    total_n  = sum(p.numel() for p in model.parameters())
+    return float((total_sq / total_n) ** 0.5)
+
+
 @torch.no_grad()
 def robustness_curve(model: FFN, X: torch.Tensor, y: torch.Tensor,
-                     sigmas=NOISE_SIGMAS, n_trials=5) -> list[float]:
+                     sigmas=NOISE_SIGMAS, n_trials=5) -> tuple:
     """
-    For each σ in sigmas: add IID Gaussian noise N(0,σ²) to all weights,
-    average accuracy over n_trials.
+    Returns (abs_curve, rel_curve).
+
+    abs_curve: noise added as absolute N(0, sigma^2) — confounded by weight scale.
+    rel_curve: noise scaled by per-parameter RMS, so sigma is SNR-matched.
+               sigma_eff = sigma * rms(param) per tensor.
+
+    If ES weights are smaller than GD weights, absolute noise is already a
+    larger relative hit on ES — so ES being *more* robust on abs_curve is if
+    anything a conservative estimate. rel_curve removes this doubt entirely.
     """
     original = {n: p.data.clone() for n, p in model.named_parameters()}
-    accs = []
+    abs_accs, rel_accs = [], []
+
     for sigma in sigmas:
-        trial_accs = []
+        abs_trials, rel_trials = [], []
         for _ in range(n_trials):
+            # absolute noise
             for p in model.parameters():
                 p.data += torch.randn_like(p.data) * sigma
-            logits = model(X)
-            trial_accs.append((logits.argmax(1) == y).float().mean().item())
-            # restore
+            abs_trials.append((model(X).argmax(1) == y).float().mean().item())
             for name, p in model.named_parameters():
                 p.data.copy_(original[name])
-        accs.append(float(np.mean(trial_accs)))
-    return accs
+
+            # relative noise: sigma * rms(param) per tensor
+            for p in model.parameters():
+                rms = p.data.pow(2).mean().sqrt().clamp(min=1e-8)
+                p.data += torch.randn_like(p.data) * sigma * rms
+            rel_trials.append((model(X).argmax(1) == y).float().mean().item())
+            for name, p in model.named_parameters():
+                p.data.copy_(original[name])
+
+        abs_accs.append(float(np.mean(abs_trials)))
+        rel_accs.append(float(np.mean(rel_trials)))
+
+    return abs_accs, rel_accs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -325,11 +350,14 @@ def main():
         # 3. Effective rank
         er = effective_ranks(model)
 
-        # 4. Robustness curve
-        rob = robustness_curve(model, X_test, y_test)
-        rob_curves[(method, hidden, seed)] = rob
-        rob_auc = float(np.trapezoid(rob, NOISE_SIGMAS) /
-                        (NOISE_SIGMAS[-1] - NOISE_SIGMAS[0]))
+        # 4. Robustness curve — both absolute and relative (scale-controlled)
+        wrms = weight_rms(model)
+        abs_rob, rel_rob = robustness_curve(model, X_test, y_test)
+        rob_curves[(method, hidden, seed)] = (abs_rob, rel_rob)
+        _trapz       = getattr(np, "trapezoid", None) or np.trapz
+        span         = NOISE_SIGMAS[-1] - NOISE_SIGMAS[0]
+        rob_auc_abs  = float(_trapz(abs_rob, NOISE_SIGMAS) / span)
+        rob_auc_rel  = float(_trapz(rel_rob, NOISE_SIGMAS) / span)
 
         # 5. Dead neurons
         dead = dead_neuron_fraction(model, X_test)
@@ -350,7 +378,9 @@ def main():
             regularity_mean=reg["mean"],
             erank_W1=er["erank_W1"], erank_W2=er["erank_W2"],
             erank_W1_norm=er["erank_W1_norm"], erank_W2_norm=er["erank_W2_norm"],
-            robustness_auc=rob_auc,
+            robustness_auc_abs=rob_auc_abs,
+            robustness_auc_rel=rob_auc_rel,
+            weight_rms=wrms,
             dead_neuron_frac=dead,
             si_mean=si["si_mean"], si_std=si["si_std"],
             si_frac_high=si["si_frac_high"],
@@ -358,7 +388,8 @@ def main():
 
         print(f"  acc={acc:.4f}  Q={Q:.3f}  reg={reg['mean']:.3f}  "
               f"erank_W1={er['erank_W1']:.1f}  dead={dead:.3f}  "
-              f"SI={si['si_mean']:.3f}")
+              f"SI={si['si_mean']:.3f}  wrms={wrms:.4f}  "
+              f"rob_abs={rob_auc_abs:.3f}  rob_rel={rob_auc_rel:.3f}")
 
     # ── CKA: compare ES vs GD representations ───────────────────────────────
     print("\nComputing CKA (ES vs GD) …")
@@ -433,41 +464,53 @@ def plot_analysis(df, rob_curves, si_dists, cka_matrix):
                  "3. Effective rank W1 (normalised)\n(↑ uses more dimensions)")
     ax.set_ylim(0, 1)
 
-    # ── 4. Robustness curves — mean over seeds, per hidden size ───────────────
+    # ── 4. Robustness abs curves ─────────────────────────────────────────────
     ax = axes[1, 0]
     for method in ("ES", "GD"):
         ls = "--" if method == "ES" else "-"
         for h in HIDDEN_SIZES:
-            curves = [rob_curves[(method, h, s)]
-                      for s in SEEDS if (method, h, s) in rob_curves]
-            if not curves:
+            pairs = [rob_curves[(method, h, s)]
+                     for s in SEEDS if (method, h, s) in rob_curves]
+            if not pairs:
                 continue
-            mean_curve = np.mean(curves, axis=0)
-            ax.plot(NOISE_SIGMAS, mean_curve,
+            mean_abs = np.mean([p[0] for p in pairs], axis=0)
+            ax.plot(NOISE_SIGMAS, mean_abs,
                     color=COLORS_HIDDEN[h], linestyle=ls, linewidth=1.8,
                     label=f"{method} H={h}")
-    ax.set_xlabel("Weight noise σ")
+    ax.set_xlabel("Weight noise σ (absolute)")
     ax.set_ylabel("Test Accuracy")
-    ax.set_title("4. Robustness\n(ES= dashed, GD= solid; colour = hidden size)")
-    ax.legend(fontsize=6, ncol=2)
-    ax.grid(True, alpha=0.3)
+    ax.set_title("4. Robustness — Absolute noise\n(ES=dashed GD=solid; colour=H)")
+    ax.legend(fontsize=6, ncol=2); ax.grid(True, alpha=0.3); ax.set_ylim(0, 1)
 
-    # ── 5. Robustness AUC bar chart ───────────────────────────────────────────
+    # ── 5. Robustness rel curves (scale-corrected) ───────────────────────────
     ax = axes[1, 1]
-    grouped_bars(ax, df, "robustness_auc", "AUC (accuracy vs noise)",
-                 "5. Robustness AUC\n(↑ maintains accuracy under weight noise)")
+    for method in ("ES", "GD"):
+        ls = "--" if method == "ES" else "-"
+        for h in HIDDEN_SIZES:
+            pairs = [rob_curves[(method, h, s)]
+                     for s in SEEDS if (method, h, s) in rob_curves]
+            if not pairs:
+                continue
+            mean_rel = np.mean([p[1] for p in pairs], axis=0)
+            ax.plot(NOISE_SIGMAS, mean_rel,
+                    color=COLORS_HIDDEN[h], linestyle=ls, linewidth=1.8,
+                    label=f"{method} H={h}")
+    ax.set_xlabel("Noise fraction of weight RMS (σ_rel)")
+    ax.set_ylabel("Test Accuracy")
+    ax.set_title("5. Robustness — Scale-normalised noise\n(controls for weight magnitude)")
+    ax.legend(fontsize=6, ncol=2); ax.grid(True, alpha=0.3); ax.set_ylim(0, 1)
 
-    # ── 6. Dead neurons ───────────────────────────────────────────────────────
+    # ── 6. Weight RMS — checks whether scale confounds robustness ────────────
     ax = axes[1, 2]
-    grouped_bars(ax, df, "dead_neuron_frac", "Fraction of dead neurons",
-                 "6. Dead Neurons\n(↑ more ReLU neurons always silent)")
-    ax.set_ylim(0, 1)
+    grouped_bars(ax, df, "weight_rms", "RMS weight magnitude",
+                 "6. Weight RMS\n(confound check: if ES << GD, abs noise is unfair)")
+    ax.set_title("6. Weight RMS\n(confound: abs noise unfair if ES≠GD scale)")
 
-    # ── 7. Selectivity index (mean) ───────────────────────────────────────────
+    # ── 7. Dead neurons ───────────────────────────────────────────────────────
     ax = axes[2, 0]
-    grouped_bars(ax, df, "si_mean", "Mean selectivity index",
-                 "7. Neuron Selectivity (mean SI)\n(↑ fractured | ↓ entangled)")
-    ax.set_ylim(0, 1)
+    grouped_bars(ax, df, "dead_neuron_frac", "Fraction of dead neurons",
+                 "7. Dead Neurons\n(↑ more ReLU neurons always silent)")
+    ax.set_ylim(0, 0.15)
 
     # ── 8. Selectivity distributions (violin) ────────────────────────────────
     ax = axes[2, 1]
@@ -533,22 +576,24 @@ def plot_analysis(df, rob_curves, si_dists, cka_matrix):
     print("  ANALYSIS SUMMARY — mean ± std across seeds")
     print("═" * 80)
     metrics = [
-        ("accuracy",        "Accuracy"),
-        ("modularity_Q",    "Modularity Q"),
-        ("regularity_mean", "Regularity"),
-        ("erank_W1_norm",   "Eff.rank W1 (norm)"),
-        ("robustness_auc",  "Robustness AUC"),
-        ("dead_neuron_frac","Dead neurons"),
-        ("si_mean",         "SI mean"),
-        ("si_frac_high",    "SI frac > 0.5"),
+        ("accuracy",             "Accuracy"),
+        ("weight_rms",           "Weight RMS"),
+        ("modularity_Q",         "Modularity Q"),
+        ("regularity_mean",      "Regularity"),
+        ("erank_W1_norm",        "Eff.rank W1 (norm)"),
+        ("robustness_auc_abs",   "Robustness AUC (abs)"),
+        ("robustness_auc_rel",   "Robustness AUC (rel)"),
+        ("dead_neuron_frac",     "Dead neurons"),
+        ("si_mean",              "SI mean"),
+        ("si_frac_high",         "SI frac > 0.5"),
     ]
-    hdr = f"{'Metric':<22}" + "".join(
+    hdr = f"{'Metric':<26}" + "".join(
         f"  ES H={h:<4d}   GD H={h:<4d}" for h in HIDDEN_SIZES
     )
     print(hdr)
     print("─" * len(hdr))
     for col, label in metrics:
-        row = f"{label:<22}"
+        row = f"{label:<26}"
         for h in HIDDEN_SIZES:
             for method in ("ES", "GD"):
                 m, s = summary_stat(df, col, method, h)
